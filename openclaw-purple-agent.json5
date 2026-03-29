@@ -1,0 +1,36 @@
+{
+  // Minimal Amber component manifest for the OpenClaw purple agent.
+  manifest_version: "0.1.0",
+
+  program: {
+    image: "ghcr.io/agrozold/openclaw-purple-agent:latest",
+    entrypoint: [
+      "python",
+      "/app/agentbeats_purple_agent.py",
+      "serve",
+      "--host",
+      "0.0.0.0",
+      "--port",
+      "8000",
+    ],
+    network: {
+      endpoints: [
+        {
+          name: "a2a",
+          port: 8000,
+        },
+      ],
+    },
+  },
+
+  provides: {
+    agent: {
+      kind: "http",
+      endpoint: "a2a",
+    },
+  },
+
+  exports: {
+    agent: "agent",
+  },
+}

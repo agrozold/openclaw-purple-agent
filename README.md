@@ -17,6 +17,7 @@ The public package exposes a minimal A2A-compatible HTTP surface for local smoke
 
 - `agentbeats_purple_agent.py`: minimal A2A-compatible purple agent
 - `Dockerfile`: container entrypoint for assessment runs
+- `openclaw-purple-agent.json5`: Amber component manifest for AgentBeats registration
 - `abstract.md`: short submission abstract
 - `scenario.template.toml`: starting point for manual or local leaderboard runs
 
