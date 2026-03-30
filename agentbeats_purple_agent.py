@@ -1053,6 +1053,7 @@ def decide_next_action(state: ConversationState, incoming_text: str) -> tuple[di
     heuristic_candidate, heuristic_source = heuristic_action(state, incoming_text)
     if heuristic_candidate.get("name") != RESPOND_ACTION_NAME and (
         os.environ.get("OPENCLAW_AGENTBEATS_FORCE_HEURISTIC", "").strip() == "1"
+        or bool(tools)
         or USER_MESSAGES_MARKER in incoming_text
     ):
         return heuristic_candidate, {"action_source": heuristic_source}
