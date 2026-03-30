@@ -559,8 +559,8 @@ def _extract_quoted_value(text: str) -> str:
 def _arg_synonyms(name: str) -> tuple[str, ...]:
     lowered = name.lower()
     mapping = {
-        "title": ("title", "subject", "called", "named"),
-        "name": ("name", "called", "named"),
+        "title": ("title", "task title", "task name", "subject", "called", "named"),
+        "name": ("name", "task name", "called", "named"),
         "summary": ("summary", "title", "subject"),
         "description": ("description", "details", "about", "body"),
         "content": ("content", "message", "body"),
@@ -569,7 +569,7 @@ def _arg_synonyms(name: str) -> tuple[str, ...]:
         "phone": ("phone", "telephone", "mobile"),
         "zip": ("zip", "postal", "postcode"),
         "zip_code": ("zip", "postal", "postcode"),
-        "user_id": ("user id", "customer id"),
+        "user_id": ("user id", "customer id", "assignee", "assigned to"),
         "task_id": ("task id", "ticket id", "case id"),
         "id": ("id",),
         "status": ("status", "state"),
@@ -584,29 +584,30 @@ def _arg_synonyms(name: str) -> tuple[str, ...]:
 def _extract_keyword_value(text: str, synonyms: tuple[str, ...]) -> str:
     lowered = text.lower()
     for synonym in synonyms:
-        pattern = re.compile(rf"{re.escape(synonym.lower())}\s*(?:is|=|:)?\s*([^\n,.;]+)")
+        pattern = re.compile(rf"(?<![\w-]){re.escape(synonym.lower())}(?![\w-])\s*(?:is|=|:)?\s*([^\n,.;]+)")
         match = pattern.search(lowered)
         if match:
             raw = text[match.start(1) : match.end(1)].strip()
             if raw:
-                return raw.strip(" .")
+                cleaned = re.sub(r"^[\s>*`#-]+", "", raw)
+                cleaned = re.sub(r"^[*_~]+", "", cleaned)
+                cleaned = re.sub(r"[\s`*_~]+$", "", cleaned)
+                return cleaned.strip(" .")
     return ""
 
 
-def extract_argument_value(argument_name: str, text: str) -> Any:
+def explicit_argument_value(argument_name: str, text: str, *, required: bool = False) -> Any:
     lowered = argument_name.lower()
     cleaned_text = normalize_user_request_text(text)
     quoted = _extract_quoted_value(cleaned_text)
     keyword_value = _extract_keyword_value(cleaned_text, _arg_synonyms(argument_name))
 
     if lowered in {"title", "name", "summary", "subject"}:
-        if quoted:
-            return quoted
+        return quoted or keyword_value
+    if lowered in {"description", "details", "content", "message", "body", "reason", "request"}:
         if keyword_value:
             return keyword_value
-        return cleaned_text.strip()[:80]
-    if lowered in {"description", "details", "content", "message", "body", "reason", "request"}:
-        return keyword_value or cleaned_text.strip()
+        return cleaned_text.strip() if required else ""
     if "priority" in lowered:
         for candidate in ("critical", "urgent", "high", "medium", "normal", "low"):
             if candidate in cleaned_text.lower():
@@ -643,6 +644,22 @@ def extract_argument_value(argument_name: str, text: str) -> Any:
                 return candidate
         return keyword_value
     return keyword_value or quoted
+
+
+def extract_argument_value(argument_name: str, text: str, *, required: bool = False) -> Any:
+    lowered = argument_name.lower()
+    cleaned_text = normalize_user_request_text(text)
+    explicit_value = explicit_argument_value(argument_name, text, required=required)
+
+    if lowered in {"title", "name", "summary", "subject"}:
+        if explicit_value not in ("", None):
+            return explicit_value
+        return cleaned_text.strip()[:80]
+    if lowered in {"description", "details", "content", "message", "body", "reason", "request"}:
+        return explicit_value or (cleaned_text.strip() if required else "")
+    if explicit_value not in ("", None):
+        return explicit_value
+    return ""
 
 
 def intent_score(tool_schema: dict[str, Any], user_text: str) -> int:
@@ -682,6 +699,48 @@ def history_hint(state: ConversationState, argument_name: str) -> Any:
     return ""
 
 
+def required_argument_ready(argument_name: str, user_text: str, state: ConversationState) -> bool:
+    explicit_value = explicit_argument_value(argument_name, user_text, required=True)
+    if explicit_value not in ("", None):
+        return True
+    historical_value = history_hint(state, argument_name)
+    if historical_value not in ("", None):
+        return True
+    return False
+
+
+def humanize_argument_name(argument_name: str) -> str:
+    mapping = {
+        "user_id": "user ID",
+        "task_id": "task ID",
+        "id": "ID",
+    }
+    lowered = argument_name.lower()
+    if lowered in mapping:
+        return mapping[lowered]
+    return lowered.replace("_", " ")
+
+
+def join_human_list(items: list[str]) -> str:
+    rendered = [item.strip() for item in items if item.strip()]
+    if not rendered:
+        return ""
+    if len(rendered) == 1:
+        return rendered[0]
+    if len(rendered) == 2:
+        return f"{rendered[0]} and {rendered[1]}"
+    return ", ".join(rendered[:-1]) + f", and {rendered[-1]}"
+
+
+def build_missing_required_response(tool_name_value: str, missing_required: list[str]) -> dict[str, Any]:
+    readable = join_human_list([humanize_argument_name(item) for item in missing_required])
+    if readable:
+        content = f"To {tool_name_value.replace('_', ' ')}, I still need the {readable}."
+    else:
+        content = f"To {tool_name_value.replace('_', ' ')}, I still need a few required details."
+    return render_action(RESPOND_ACTION_NAME, {"content": content})
+
+
 def heuristic_tool_call(state: ConversationState, user_text: str, tools: list[dict[str, Any]]) -> dict[str, Any] | None:
     best: tuple[int, dict[str, Any] | None] = (-1, None)
     for schema in tools:
@@ -693,16 +752,21 @@ def heuristic_tool_call(state: ConversationState, user_text: str, tools: list[di
         property_names = tool_property_names(schema)
         arguments: dict[str, Any] = {}
         for property_name in property_names:
-            value = extract_argument_value(property_name, user_text)
+            value = extract_argument_value(property_name, user_text, required=property_name in required_args)
             if value in ("", None):
                 value = history_hint(state, property_name)
             if value not in ("", None):
                 arguments[property_name] = value
-        missing_required = [item for item in required_args if item not in arguments]
+        missing_required = [
+            item for item in required_args if item not in arguments or not required_argument_ready(item, user_text, state)
+        ]
         if missing_required:
             score -= len(missing_required)
+            candidate = build_missing_required_response(name, missing_required)
+        else:
+            candidate = render_action(name, arguments)
         if score > best[0]:
-            best = (score, render_action(name, arguments))
+            best = (score, candidate)
     chosen = best[1]
     if best[0] >= 3 and chosen is not None:
         return chosen
@@ -934,6 +998,16 @@ def normalize_action(candidate: dict[str, Any], tools: list[dict[str, Any]]) -> 
     if not isinstance(arguments, dict):
         arguments = {}
     if name in allowed_names:
+        if name != RESPOND_ACTION_NAME:
+            for schema in tools:
+                if tool_name(schema) != name:
+                    continue
+                allowed_args = set(tool_property_names(schema))
+                if allowed_args:
+                    arguments = {
+                        key: value for key, value in arguments.items() if key in allowed_args
+                    }
+                break
         return render_action(name, arguments)
     if allowed_names - {RESPOND_ACTION_NAME}:
         fallback_tool = sorted(name for name in allowed_names if name != RESPOND_ACTION_NAME)[0]
