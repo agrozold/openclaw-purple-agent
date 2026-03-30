@@ -374,11 +374,18 @@ def extract_generic_tool_result(text: str, state: ConversationState) -> tuple[st
     if explicit is not None:
         return explicit
 
-    for marker in ('{"task_id"', '{"id"', '{"status"', '{"error"'):
-        index = text.rfind(marker)
-        if index < 0:
-            continue
-        blob = _balanced_json_slice(text, index)
+    stripped = str(text or "").strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            parsed = json.loads(stripped)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict) and any(key in parsed for key in ("task_id", "id", "status", "error", "message")):
+            name = last_assistant_action_name(state) or "tool"
+            return name, parsed
+
+    for match in re.finditer(r'\{\s*"(?:task_id|id|status|error|message)"', text):
+        blob = _balanced_json_slice(text, match.start())
         if not blob:
             continue
         try:
