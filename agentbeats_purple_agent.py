@@ -39,7 +39,8 @@ USER_MESSAGES_MARKER = "Now here are the user messages:"
 DEFAULT_AGENT_MODEL = "gemini/gemini-2.0-flash"
 MODEL_TIMEOUT_SECONDS = 45
 MAX_HISTORY_MESSAGES = 12
-QUOTED_TEXT_RE = re.compile(r"[\"“”'`](.+?)[\"“”'`]")
+DOUBLE_QUOTED_TEXT_RE = re.compile(r'"([^"\n]+)"|“([^”\n]+)”|`([^`\n]+)`')
+SINGLE_QUOTED_TEXT_RE = re.compile(r"(?:(?<=\s)|^)['‘]([^'\n]+)['’](?=\s|$|[.,;:!?])")
 EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 PHONE_RE = re.compile(r"\+?\d[\d\s().-]{6,}\d")
 ZIP_RE = re.compile(r"\b\d{5}(?:-\d{4})?\b")
@@ -342,6 +343,48 @@ def extract_tool_result(text: str) -> tuple[str, Any] | None:
     return name, parsed
 
 
+def last_assistant_action_name(state: ConversationState) -> str:
+    for entry in reversed(state.history):
+        if entry.get("role") != "assistant":
+            continue
+        try:
+            parsed = json.loads(entry.get("content") or "")
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            name = str(parsed.get("name") or "").strip()
+            if name:
+                return name
+    return ""
+
+
+def extract_generic_tool_result(text: str, state: ConversationState) -> tuple[str, Any] | None:
+    explicit = extract_tool_result(text)
+    if explicit is not None:
+        return explicit
+
+    for marker in ('{"task_id"', '{"id"', '{"status"', '{"error"'):
+        index = text.rfind(marker)
+        if index < 0:
+            continue
+        blob = _balanced_json_slice(text, index)
+        if not blob:
+            continue
+        try:
+            parsed = json.loads(blob)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            name = last_assistant_action_name(state) or "tool"
+            return name, parsed
+
+    error_match = re.search(r"Error:\s*([^\n]+)", text, re.IGNORECASE)
+    if error_match:
+        name = last_assistant_action_name(state) or "tool"
+        return name, {"status": "failed", "message": error_match.group(0).strip()}
+    return None
+
+
 def render_action(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     return {
         "name": str(name).strip(),
@@ -484,9 +527,12 @@ def tool_description(schema: dict[str, Any]) -> str:
 
 
 def _extract_quoted_value(text: str) -> str:
-    matches = QUOTED_TEXT_RE.findall(text)
-    for match in matches:
-        probe = str(match).strip()
+    for match in DOUBLE_QUOTED_TEXT_RE.finditer(text):
+        probe = next((group.strip() for group in match.groups() if group and group.strip()), "")
+        if probe:
+            return probe
+    for match in SINGLE_QUOTED_TEXT_RE.finditer(text):
+        probe = str(match.group(1) or "").strip()
         if probe:
             return probe
     return ""
@@ -559,6 +605,9 @@ def extract_argument_value(argument_name: str, text: str) -> Any:
     if lowered.endswith("_id") or lowered == "id":
         if keyword_value:
             return keyword_value.split()[0]
+        match = re.search(r"\b[a-z]+[_-]\d+\b", text, re.IGNORECASE)
+        if match:
+            return match.group(0)
         match = re.search(r"\b[A-Z]{0,3}-?\d{2,}\b", text, re.IGNORECASE)
         return match.group(0) if match else ""
     if any(token in lowered for token in ("count", "num", "quantity", "amount", "price", "cost", "total")):
@@ -597,7 +646,24 @@ def intent_score(tool_schema: dict[str, Any], user_text: str) -> int:
     return score
 
 
-def heuristic_tool_call(user_text: str, tools: list[dict[str, Any]]) -> dict[str, Any] | None:
+def history_hint(state: ConversationState, argument_name: str) -> Any:
+    lowered = argument_name.lower()
+    pattern_map = {
+        "user_id": re.compile(r"\buser[_-]\d+\b", re.IGNORECASE),
+        "task_id": re.compile(r"\btask[_-]\d+\b", re.IGNORECASE),
+        "id": re.compile(r"\b(?:task|user)[_-]\d+\b", re.IGNORECASE),
+    }
+    pattern = pattern_map.get(lowered)
+    if pattern is None:
+        return ""
+    for entry in reversed(state.history):
+        match = pattern.search(entry.get("content") or "")
+        if match:
+            return match.group(0)
+    return ""
+
+
+def heuristic_tool_call(state: ConversationState, user_text: str, tools: list[dict[str, Any]]) -> dict[str, Any] | None:
     best: tuple[int, dict[str, Any] | None] = (-1, None)
     for schema in tools:
         name = tool_name(schema)
@@ -609,6 +675,8 @@ def heuristic_tool_call(user_text: str, tools: list[dict[str, Any]]) -> dict[str
         arguments: dict[str, Any] = {}
         for property_name in property_names:
             value = extract_argument_value(property_name, user_text)
+            if value in ("", None):
+                value = history_hint(state, property_name)
             if value not in ("", None):
                 arguments[property_name] = value
         missing_required = [item for item in required_args if item not in arguments]
@@ -841,12 +909,12 @@ def model_action(state: ConversationState, incoming_text: str) -> tuple[dict[str
 
 
 def heuristic_action(state: ConversationState, incoming_text: str) -> tuple[dict[str, Any], str]:
-    if tool_result := extract_tool_result(incoming_text):
+    if tool_result := extract_generic_tool_result(incoming_text, state):
         tool_name_value, payload = tool_result
         return heuristic_tool_result_action(tool_name_value, payload), "heuristic:tool_result"
     user_text = extract_latest_user_text(incoming_text)
     if state.tools:
-        if action := heuristic_tool_call(user_text, state.tools):
+        if action := heuristic_tool_call(state, user_text, state.tools):
             return action, "heuristic:tool_call"
     return render_action(RESPOND_ACTION_NAME, {"content": "Please share the task details you want me to resolve."}), "heuristic:clarify"
 
@@ -855,12 +923,15 @@ def decide_next_action(state: ConversationState, incoming_text: str) -> tuple[di
     tools = extract_tool_schemas(incoming_text)
     if tools:
         state.tools = tools
-    if extract_tool_result(incoming_text):
+    if extract_generic_tool_result(incoming_text, state):
         action, source = heuristic_action(state, incoming_text)
         return action, {"action_source": source}
 
     heuristic_candidate, heuristic_source = heuristic_action(state, incoming_text)
-    if heuristic_candidate.get("name") != RESPOND_ACTION_NAME and os.environ.get("OPENCLAW_AGENTBEATS_FORCE_HEURISTIC", "").strip() == "1":
+    if heuristic_candidate.get("name") != RESPOND_ACTION_NAME and (
+        os.environ.get("OPENCLAW_AGENTBEATS_FORCE_HEURISTIC", "").strip() == "1"
+        or USER_MESSAGES_MARKER in incoming_text
+    ):
         return heuristic_candidate, {"action_source": heuristic_source}
 
     if os.environ.get("OPENCLAW_AGENTBEATS_DISABLE_MODEL", "").strip() != "1":
