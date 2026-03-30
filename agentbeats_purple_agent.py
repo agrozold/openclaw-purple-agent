@@ -375,7 +375,14 @@ def extract_generic_tool_result(text: str, state: ConversationState) -> tuple[st
         return explicit
 
     stripped = str(text or "").strip()
-    if USER_MESSAGES_MARKER in stripped or "Here's a list of tools you can use" in stripped:
+    prompt_like_markers = (
+        USER_MESSAGES_MARKER,
+        TOOLS_MARKER,
+        "Here's a list of tools you can use",
+        "Additionally, you can respond to the user",
+        "Please respond in JSON format.",
+    )
+    if any(marker in stripped for marker in prompt_like_markers):
         return None
     if stripped.startswith("{") and stripped.endswith("}"):
         try:
