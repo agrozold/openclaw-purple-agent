@@ -4,14 +4,16 @@ This repository is the public AgentX-AgentBeats submission package for the OpenC
 
 ## What It Does
 
-OpenClaw focuses on bounded operator workflows:
+OpenClaw focuses on bounded operator workflows and tau2-safe action selection:
 
 - bounty triage
 - repository execution planning
 - browser-assisted research
 - truthful readiness and blocker reporting
+- single-step tool calling for tau2-style benchmark turns
 
 The public package exposes a minimal A2A-compatible HTTP surface for local smoke tests and competition submissions.
+It also keeps a hard refusal boundary against wallet, mnemonic, SSH, and arbitrary local-disk probes.
 
 ## Files
 

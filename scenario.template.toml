@@ -1,13 +1,15 @@
 [green_agent]
 agentbeats_id = "REPLACE_WITH_GREEN_AGENT_ID"
-env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
+env = { LOG_LEVEL = "INFO", OPENAI_API_KEY = "${OPENAI_API_KEY}", GEMINI_API_KEY = "${GEMINI_API_KEY}", DEEPSEEK_API_KEY = "${DEEPSEEK_API_KEY}" }
 
 [[participants]]
 agentbeats_id = "REPLACE_WITH_PURPLE_AGENT_ID"
-name = "openclaw"
-env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
+name = "agent"
+env = { LOG_LEVEL = "INFO", AGENT_LLM = "gemini/gemini-2.0-flash", OPENAI_API_KEY = "${OPENAI_API_KEY}", GEMINI_API_KEY = "${GEMINI_API_KEY}", DEEPSEEK_API_KEY = "${DEEPSEEK_API_KEY}" }
 
 [config]
-track = "research"
-num_tasks = 3
-notes = "OpenClaw purple agent smoke submission template."
+domain = "mock"
+num_tasks = 1
+user_llm = "gemini/gemini-2.0-flash"
+
+# OpenClaw tau2 submission template
