@@ -91,6 +91,35 @@ def normalize_base_url(candidate: str) -> str:
     return ""
 
 
+def jsonrpc_success(response_id: Any, result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": response_id,
+        "result": result,
+    }
+
+
+def jsonrpc_error(response_id: Any, code: int, message: str) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": response_id,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    }
+
+
+def unwrap_request_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    if not isinstance(payload, dict):
+        return {}, {}, False
+    method = str(payload.get("method") or "").strip()
+    params = payload.get("params")
+    if method and isinstance(params, dict):
+        return payload, params, True
+    return payload, payload, False
+
+
 class ConversationState:
     def __init__(self, context_id: str):
         self.context_id = context_id
@@ -108,7 +137,7 @@ class ConversationState:
 
 
 def build_agent_card(base_url: str, repo_url: str = "") -> dict[str, Any]:
-    service_url = base_url.rstrip("/") + "/message:send"
+    service_url = base_url.rstrip("/")
     return {
         "name": "OpenClaw Purple Agent",
         "description": "Bounded tau2-capable operator agent for safe tool use, execution planning, and truthful readiness reporting.",
@@ -117,7 +146,7 @@ def build_agent_card(base_url: str, repo_url: str = "") -> dict[str, Any]:
             "organization": "OpenClaw",
             "url": repo_url or "",
         },
-        "version": "0.2.1",
+        "version": "0.2.2",
         "capabilities": {
             "streaming": False,
             "pushNotifications": False,
@@ -357,21 +386,24 @@ def build_task(task_id: str, assessment_request: dict[str, Any], *, context_id: 
     return {
         "id": task_id,
         "kind": "task",
-        "context_id": context_id or str(uuid.uuid4()),
+        "contextId": context_id or str(uuid.uuid4()),
         "status": {
             "state": "completed",
             "timestamp": utc_now_iso(),
         },
         "artifacts": [
             {
+                "artifactId": f"{task_id}-report",
                 "name": "openclaw-assessment-report",
-                "mimeType": "application/json",
                 "parts": [
                     {
                         "kind": "text",
                         "text": json.dumps(report, ensure_ascii=False),
                     }
                 ],
+                "metadata": {
+                    "mimeType": "application/json",
+                },
             }
         ],
         "metadata": {
@@ -386,21 +418,24 @@ def build_action_task(task_id: str, context_id: str, action: dict[str, Any], met
     return {
         "id": task_id,
         "kind": "task",
-        "context_id": context_id,
+        "contextId": context_id,
         "status": {
             "state": "completed",
             "timestamp": utc_now_iso(),
         },
         "artifacts": [
             {
+                "artifactId": f"{task_id}-action",
                 "name": "openclaw-action",
-                "mimeType": "application/json",
                 "parts": [
                     {
                         "kind": "text",
                         "text": payload,
                     }
                 ],
+                "metadata": {
+                    "mimeType": "application/json",
+                },
             }
         ],
         "metadata": {
@@ -920,25 +955,45 @@ class PurpleAgentHandler(BaseHTTPRequestHandler):
         self.send_json({"error": "not_found", "path": self.path}, status=404)
 
     def do_POST(self) -> None:
-        if self.path != "/message:send":
+        if self.path not in {"/", "/message:send"}:
             self.send_json({"error": "not_found", "path": self.path}, status=404)
             return
-        payload = self.read_json_body()
-        task_id = str(uuid.uuid4())
-        context_id = extract_context_id(payload) or str(uuid.uuid4())
+        envelope = self.read_json_body()
+        payload, request_payload, is_jsonrpc = unwrap_request_payload(envelope)
+        method = str(payload.get("method") or "").strip()
+        request_id = payload.get("id")
 
-        if looks_like_secret_probe(payload):
+        if is_jsonrpc and method == "tasks/get":
+            task_lookup_id = str(request_payload.get("id") or request_payload.get("taskId") or "").strip()
+            task = self.server.tasks.get(task_lookup_id)
+            if task is None:
+                self.send_json(jsonrpc_error(request_id, -32001, f"task not found: {task_lookup_id}"), status=404)
+                return
+            self.send_json(jsonrpc_success(request_id, task))
+            return
+
+        if is_jsonrpc and method not in {"", "message/send"}:
+            self.send_json(jsonrpc_error(request_id, -32601, f"unsupported method: {method}"), status=404)
+            return
+
+        task_id = str(uuid.uuid4())
+        context_id = extract_context_id(request_payload) or str(uuid.uuid4())
+
+        if looks_like_secret_probe(request_payload):
             task = build_refusal_task(task_id, context_id)
-        elif looks_like_assessment_request(payload):
-            task = build_task(task_id, extract_assessment_request(payload), context_id=context_id)
+        elif looks_like_assessment_request(request_payload):
+            task = build_task(task_id, extract_assessment_request(request_payload), context_id=context_id)
         else:
-            incoming_text = extract_message_text(payload)
+            incoming_text = extract_message_text(request_payload)
             state = self.server.conversation(context_id)
             action, metadata = decide_next_action(state, incoming_text)
             state.append("user", incoming_text)
             state.append("assistant", json.dumps(action, ensure_ascii=False))
             task = build_action_task(task_id, context_id, action, metadata)
         self.server.tasks[task_id] = task
+        if is_jsonrpc:
+            self.send_json(jsonrpc_success(request_id, task))
+            return
         self.send_json({"task": task})
 
 
