@@ -46,6 +46,7 @@ PHONE_RE = re.compile(r"\+?\d[\d\s().-]{6,}\d")
 ZIP_RE = re.compile(r"\b\d{5}(?:-\d{4})?\b")
 NUMBER_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
 TOOL_RESULT_RE = re.compile(r"Tool '([^']+)' result:\s*(.+)", re.DOTALL)
+ASSISTANT_PREAMBLE_RE = re.compile(r"^(?:hi|hello|hey)[!.]?\s+how can i help you today\??$", re.IGNORECASE)
 
 MODEL_GUARD_PROMPT = """You are OpenClaw Purple Agent inside a benchmark orchestrator.
 
@@ -198,6 +199,16 @@ def parse_text_parts(message: dict[str, Any]) -> list[str]:
     return result
 
 
+def normalize_user_request_text(text: str) -> str:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    while lines and (
+        ASSISTANT_PREAMBLE_RE.match(lines[0])
+        or lines[0].lower().startswith(("assistant:", "agent:"))
+    ):
+        lines.pop(0)
+    return "\n".join(lines).strip()
+
+
 def extract_message_text(payload: dict[str, Any]) -> str:
     message = payload.get("message", {})
     fragments: list[str] = []
@@ -326,8 +337,8 @@ def extract_tool_schemas(text: str) -> list[dict[str, Any]]:
 def extract_latest_user_text(text: str) -> str:
     marker_index = text.find(USER_MESSAGES_MARKER)
     if marker_index < 0:
-        return text.strip()
-    return text[marker_index + len(USER_MESSAGES_MARKER) :].strip()
+        return normalize_user_request_text(text)
+    return normalize_user_request_text(text[marker_index + len(USER_MESSAGES_MARKER) :])
 
 
 def extract_tool_result(text: str) -> tuple[str, Any] | None:
@@ -577,41 +588,42 @@ def _extract_keyword_value(text: str, synonyms: tuple[str, ...]) -> str:
 
 def extract_argument_value(argument_name: str, text: str) -> Any:
     lowered = argument_name.lower()
-    quoted = _extract_quoted_value(text)
-    keyword_value = _extract_keyword_value(text, _arg_synonyms(argument_name))
+    cleaned_text = normalize_user_request_text(text)
+    quoted = _extract_quoted_value(cleaned_text)
+    keyword_value = _extract_keyword_value(cleaned_text, _arg_synonyms(argument_name))
 
     if lowered in {"title", "name", "summary", "subject"}:
         if quoted:
             return quoted
         if keyword_value:
             return keyword_value
-        return text.strip()[:80]
+        return cleaned_text.strip()[:80]
     if lowered in {"description", "details", "content", "message", "body", "reason", "request"}:
-        return keyword_value or text.strip()
+        return keyword_value or cleaned_text.strip()
     if "priority" in lowered:
         for candidate in ("critical", "urgent", "high", "medium", "normal", "low"):
-            if candidate in text.lower():
+            if candidate in cleaned_text.lower():
                 return "medium" if candidate == "normal" else candidate
         return ""
     if lowered in {"email", "email_address"}:
-        match = EMAIL_RE.search(text)
+        match = EMAIL_RE.search(cleaned_text)
         return match.group(0) if match else ""
     if lowered in {"phone", "phone_number"}:
-        match = PHONE_RE.search(text)
+        match = PHONE_RE.search(cleaned_text)
         return match.group(0) if match else ""
     if lowered in {"zip", "zip_code", "postal_code", "postcode"}:
-        match = ZIP_RE.search(text)
+        match = ZIP_RE.search(cleaned_text)
         return match.group(0) if match else ""
     if lowered.endswith("_id") or lowered == "id":
         if keyword_value:
             return keyword_value.split()[0]
-        match = re.search(r"\b[a-z]+[_-]\d+\b", text, re.IGNORECASE)
+        match = re.search(r"\b[a-z]+[_-]\d+\b", cleaned_text, re.IGNORECASE)
         if match:
             return match.group(0)
-        match = re.search(r"\b[A-Z]{0,3}-?\d{2,}\b", text, re.IGNORECASE)
+        match = re.search(r"\b[A-Z]{0,3}-?\d{2,}\b", cleaned_text, re.IGNORECASE)
         return match.group(0) if match else ""
     if any(token in lowered for token in ("count", "num", "quantity", "amount", "price", "cost", "total")):
-        match = NUMBER_RE.search(text)
+        match = NUMBER_RE.search(cleaned_text)
         if not match:
             return ""
         value = match.group(0)
@@ -620,7 +632,7 @@ def extract_argument_value(argument_name: str, text: str) -> Any:
         return keyword_value
     if lowered == "status":
         for candidate in ("open", "closed", "pending", "cancelled", "confirmed", "created"):
-            if candidate in text.lower():
+            if candidate in cleaned_text.lower():
                 return candidate
         return keyword_value
     return keyword_value or quoted
@@ -695,6 +707,27 @@ def heuristic_tool_result_action(tool_name_value: str, tool_result: Any) -> dict
         if any(key in tool_result for key in ("error", "errors", "message")) and str(tool_result.get("status") or "").lower() in {"error", "failed"}:
             content = f"{tool_name_value} failed. Please give me the missing details so I can try again."
             return render_action(RESPOND_ACTION_NAME, {"content": content})
+        task_id = str(tool_result.get("task_id") or tool_result.get("id") or "").strip()
+        title = str(tool_result.get("title") or tool_result.get("name") or "").strip()
+        status = str(tool_result.get("status") or "").strip()
+        if tool_name_value == "create_task":
+            parts = ["I created the task."]
+            if title:
+                parts[0] = f"I created the task '{title}'."
+            if status:
+                parts.append(f"It is currently {status}.")
+            if task_id:
+                parts.append(f"Task ID: {task_id}.")
+            return render_action(RESPOND_ACTION_NAME, {"content": " ".join(parts)})
+        if tool_name_value == "update_task_status":
+            parts = ["I updated the task status."]
+            if title and status:
+                parts[0] = f"The task '{title}' is now {status}."
+            elif status:
+                parts[0] = f"The task is now {status}."
+            if task_id:
+                parts.append(f"Task ID: {task_id}.")
+            return render_action(RESPOND_ACTION_NAME, {"content": " ".join(parts)})
         key_summary = []
         for key in ("task_id", "id", "status", "confirmation", "message"):
             value = tool_result.get(key)
