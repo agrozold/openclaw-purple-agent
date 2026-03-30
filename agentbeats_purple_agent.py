@@ -47,6 +47,12 @@ ZIP_RE = re.compile(r"\b\d{5}(?:-\d{4})?\b")
 NUMBER_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
 TOOL_RESULT_RE = re.compile(r"Tool '([^']+)' result:\s*(.+)", re.DOTALL)
 ASSISTANT_PREAMBLE_RE = re.compile(r"^(?:hi|hello|hey)[!.]?\s+how can i help you today\??$", re.IGNORECASE)
+REQUEST_LABELS = (
+    "user request:",
+    "user message:",
+    "request:",
+    "message:",
+)
 
 MODEL_GUARD_PROMPT = """You are OpenClaw Purple Agent inside a benchmark orchestrator.
 
@@ -337,6 +343,20 @@ def extract_tool_schemas(text: str) -> list[dict[str, Any]]:
 def extract_latest_user_text(text: str) -> str:
     marker_index = text.find(USER_MESSAGES_MARKER)
     if marker_index < 0:
+        tools_index = text.find(TOOLS_MARKER)
+        if tools_index >= 0:
+            list_start = text.find("[", tools_index)
+            blob = _balanced_json_slice(text, list_start) if list_start >= 0 else ""
+            if blob:
+                tail = text[list_start + len(blob) :]
+                lowered_tail = tail.lower()
+                for label in REQUEST_LABELS:
+                    label_index = lowered_tail.rfind(label)
+                    if label_index >= 0:
+                        return normalize_user_request_text(tail[label_index + len(label) :])
+                tail_lines = [line.strip() for line in tail.splitlines() if line.strip()]
+                if tail_lines:
+                    return normalize_user_request_text(tail_lines[-1])
         return normalize_user_request_text(text)
     return normalize_user_request_text(text[marker_index + len(USER_MESSAGES_MARKER) :])
 
