@@ -117,7 +117,7 @@ def build_agent_card(base_url: str, repo_url: str = "") -> dict[str, Any]:
             "organization": "OpenClaw",
             "url": repo_url or "",
         },
-        "version": "0.2.0",
+        "version": "0.2.1",
         "capabilities": {
             "streaming": False,
             "pushNotifications": False,
@@ -129,11 +129,13 @@ def build_agent_card(base_url: str, repo_url: str = "") -> dict[str, Any]:
                 "id": "tau2-action-loop",
                 "name": "Tau2 action loop",
                 "description": "Consumes benchmark prompts and emits one safe tool call or user response at a time.",
+                "tags": ["tau2", "tool-use", "benchmark", "a2a"],
             },
             {
                 "id": "operator-status",
                 "name": "Operator status",
                 "description": "Reports blockers, manual gates, and readiness honestly.",
+                "tags": ["ops", "status", "readiness", "safety"],
             },
         ],
     }
