@@ -3,16 +3,32 @@ from __future__ import annotations
 
 import argparse
 import json
-import threading
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-
-ROOT_DIR = Path(__file__).resolve().parents[1]
+SENSITIVE_PROBE_PATTERNS = (
+    "wallet",
+    "wallets",
+    "mnemonic",
+    "seed phrase",
+    "private key",
+    "secret",
+    "secrets",
+    "ssh",
+    ".ssh",
+    "secrets.env",
+    "wallet.key",
+    "filesystem",
+    "file system",
+    "disk",
+    "ls /",
+    "cat /",
+    "/root/",
+    ".bittensor",
+)
 
 
 def utc_now_iso() -> str:
@@ -73,6 +89,25 @@ def parse_text_parts(message: dict[str, Any]) -> list[str]:
     return result
 
 
+def looks_like_secret_probe(payload: dict[str, Any]) -> bool:
+    fragments: list[str] = []
+    message = payload.get("message", {})
+    if isinstance(message, dict):
+        fragments.extend(parse_text_parts(message))
+    metadata = payload.get("metadata", {})
+    if isinstance(metadata, dict):
+        for key in ("prompt", "instruction", "request", "assessment_request"):
+            value = metadata.get(key)
+            if isinstance(value, dict):
+                fragments.append(json.dumps(value, ensure_ascii=False))
+            elif isinstance(value, str):
+                fragments.append(value)
+    blob = " ".join(part.lower() for part in fragments if part).strip()
+    if not blob:
+        return False
+    return any(pattern in blob for pattern in SENSITIVE_PROBE_PATTERNS)
+
+
 def extract_assessment_request(payload: dict[str, Any]) -> dict[str, Any]:
     if isinstance(payload.get("metadata"), dict):
         metadata = payload["metadata"]
@@ -93,6 +128,42 @@ def extract_assessment_request(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_refusal_task(task_id: str) -> dict[str, Any]:
+    report = {
+        "agent": "openclaw-purple",
+        "summary": "OpenClaw refused a request for secrets or local filesystem details.",
+        "policy": [
+            "Do not disclose wallets, mnemonics, private keys, SSH material, or secrets.env contents.",
+            "Do not reveal arbitrary local filesystem paths or file contents.",
+            "Provide only bounded public status and competition metadata.",
+        ],
+        "generated_at": utc_now_iso(),
+    }
+    return {
+        "id": task_id,
+        "kind": "task",
+        "status": {
+            "state": "completed",
+            "timestamp": utc_now_iso(),
+        },
+        "artifacts": [
+            {
+                "name": "openclaw-safety-refusal",
+                "mimeType": "application/json",
+                "parts": [
+                    {
+                        "kind": "text",
+                        "text": json.dumps(report, ensure_ascii=False),
+                    }
+                ],
+            }
+        ],
+        "metadata": {
+            "policy_decision": "refused_sensitive_request",
+        },
+    }
+
+
 def build_task(task_id: str, assessment_request: dict[str, Any]) -> dict[str, Any]:
     participant_roles = sorted(str(key) for key in assessment_request.get("participants", {}).keys())
     config = assessment_request.get("config", {}) if isinstance(assessment_request.get("config"), dict) else {}
@@ -100,11 +171,12 @@ def build_task(task_id: str, assessment_request: dict[str, Any]) -> dict[str, An
         "agent": "openclaw-purple",
         "summary": "OpenClaw accepted the assessment request and produced a bounded operator-plan report.",
         "participants": participant_roles,
-        "config": config,
+        "config_keys": sorted(str(key) for key in config.keys()),
         "recommendations": [
             "Keep the assessment stateless and scoped to one task.",
             "Prefer artifact-style outputs over chatty loops.",
             "Treat external side effects as gated unless the benchmark explicitly requires them.",
+            "Never disclose local secrets, wallet material, SSH keys, or arbitrary filesystem contents.",
         ],
         "generated_at": utc_now_iso(),
     }
@@ -193,9 +265,12 @@ class PurpleAgentHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "not_found", "path": self.path}, status=404)
             return
         payload = self.read_json_body()
-        assessment_request = extract_assessment_request(payload)
         task_id = str(uuid.uuid4())
-        task = build_task(task_id, assessment_request)
+        if looks_like_secret_probe(payload):
+            task = build_refusal_task(task_id)
+        else:
+            assessment_request = extract_assessment_request(payload)
+            task = build_task(task_id, assessment_request)
         self.server.tasks[task_id] = task
         self.send_json({"task": task})
 
